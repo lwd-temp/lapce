@@ -5,10 +5,10 @@ use floem::{
     ext_event::create_ext_action,
     reactive::{RwSignal, Scope},
     style::CursorStyle,
-    view::View,
     views::{
         clip, dyn_stack, editor::id::EditorId, empty, label, stack, svg, Decorators,
     },
+    View,
 };
 use lapce_core::buffer::{
     diff::{expand_diff_lines, rope_diff, DiffExpand, DiffLines},
@@ -18,6 +18,7 @@ use lapce_rpc::{buffer::BufferId, proxy::ProxyResponse};
 use lapce_xi_rope::Rope;
 use serde::{Deserialize, Serialize};
 
+use super::{EditorData, EditorViewKind};
 use crate::{
     config::{color::LapceColor, icon::LapceIcons},
     doc::{Doc, DocContent},
@@ -26,8 +27,6 @@ use crate::{
     wave::wave_box,
     window_tab::CommonData,
 };
-
-use super::{EditorData, EditorViewKind};
 
 #[derive(Clone)]
 pub struct DiffInfo {
@@ -544,4 +543,5 @@ pub fn diff_show_more_section_view(
         .style(|s| s.size_pct(100.0, 100.0)),
     ))
     .style(|s| s.absolute().flex_col().size_pct(100.0, 100.0))
+    .debug_name("Diff Show More Section")
 }

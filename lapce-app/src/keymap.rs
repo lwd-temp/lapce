@@ -7,11 +7,11 @@ use floem::{
         Scope,
     },
     style::CursorStyle,
-    view::View,
     views::{
         container, dyn_stack, label, scroll, stack, text, virtual_stack, Decorators,
         VirtualDirection, VirtualItemSize,
     },
+    View,
 };
 use lapce_core::mode::Modes;
 
@@ -501,6 +501,7 @@ fn keyboard_picker_view(
                     .border_color(config.color(LapceColor::LAPCE_BORDER))
             }),
         ))
+        .on_event_stop(EventListener::PointerDown, |_| {})
         .style(move |s| {
             let config = config.get();
             s.items_center()

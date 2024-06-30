@@ -3,8 +3,7 @@ use std::{cmp, path::PathBuf, rc::Rc, sync::Arc};
 use floem::{
     action::{set_ime_allowed, set_ime_cursor_area},
     context::{PaintCx, StyleCx},
-    event::{Event, EventListener},
-    id::Id,
+    event::{Event, EventListener, EventPropagation},
     keyboard::Modifiers,
     peniko::{
         kurbo::{Line, Point, Rect, Size},
@@ -15,7 +14,6 @@ use floem::{
     },
     style::{CursorColor, CursorStyle, Style, TextColor},
     taffy::prelude::NodeId,
-    view::{AnyWidget, View, ViewData, Widget},
     views::{
         clip, container, dyn_stack,
         editor::{
@@ -32,10 +30,10 @@ use floem::{
             ShowIndentGuide, SmartTab, VisibleWhitespaceColor, WrapProp,
         },
         empty, label,
-        scroll::{scroll, HideBar},
+        scroll::{scroll, HideBar, PropagatePointerWheel},
         stack, svg, Decorators,
     },
-    EventPropagation, Renderer,
+    Renderer, View, ViewId,
 };
 use itertools::Itertools;
 use lapce_core::{
@@ -127,7 +125,7 @@ pub fn editor_style(
 }
 
 pub struct EditorView {
-    data: ViewData,
+    id: ViewId,
     editor: EditorData,
     is_active: Memo<bool>,
     inner_node: Option<NodeId>,
@@ -141,7 +139,7 @@ pub fn editor_view(
     debug_breakline: Memo<Option<(usize, PathBuf)>>,
     is_active: impl Fn(bool) -> bool + 'static + Copy,
 ) -> EditorView {
-    let id = Id::next();
+    let id = ViewId::new();
     let is_active = create_memo(move |_| is_active(true));
 
     let viewport = e_data.viewport();
@@ -246,7 +244,7 @@ pub fn editor_view(
 
     let doc = e_data.doc_signal();
     EditorView {
-        data: ViewData::new(id),
+        id,
         editor: e_data,
         is_active,
         inner_node: None,
@@ -397,7 +395,7 @@ impl EditorView {
         }
     }
 
-    fn paint_cursor(
+    fn paint_current_line(
         &self,
         cx: &mut PaintCx,
         is_local: bool,
@@ -406,14 +404,11 @@ impl EditorView {
         let e_data = self.editor.clone();
         let ed = e_data.editor.clone();
         let cursor = self.editor.cursor();
-        let find_focus = self.editor.find_focus;
         let config = self.editor.common.config;
 
         let config = config.get_untracked();
         let line_height = config.editor.line_height() as f64;
         let viewport = self.viewport.get_untracked();
-        let is_active =
-            self.is_active.get_untracked() && !find_focus.get_untracked();
 
         let current_line_color = ed.es.with_untracked(EditorStyle::current_line);
 
@@ -474,10 +469,6 @@ impl EditorView {
                     }
                 }
             }
-
-            FloemEditorView::paint_selection(cx, &ed, screen_lines);
-
-            FloemEditorView::paint_cursor_caret(cx, &ed, is_active, screen_lines);
         });
     }
 
@@ -990,29 +981,11 @@ impl EditorView {
 }
 
 impl View for EditorView {
-    fn view_data(&self) -> &ViewData {
-        &self.data
+    fn id(&self) -> ViewId {
+        self.id
     }
 
-    fn view_data_mut(&mut self) -> &mut ViewData {
-        &mut self.data
-    }
-
-    fn build(self) -> AnyWidget {
-        Box::new(self)
-    }
-}
-
-impl Widget for EditorView {
-    fn view_data(&self) -> &ViewData {
-        &self.data
-    }
-
-    fn view_data_mut(&mut self) -> &mut ViewData {
-        &mut self.data
-    }
-
-    fn style(&mut self, cx: &mut StyleCx<'_>) {
+    fn style_pass(&mut self, cx: &mut StyleCx<'_>) {
         let editor = &self.editor.editor;
         if editor.es.try_update(|s| s.read(cx)).unwrap() {
             editor.floem_style_id.update(|val| *val += 1);
@@ -1026,12 +999,12 @@ impl Widget for EditorView {
 
     fn update(
         &mut self,
-        cx: &mut floem::context::UpdateCx,
+        _cx: &mut floem::context::UpdateCx,
         state: Box<dyn std::any::Any>,
     ) {
         if let Ok(state) = state.downcast() {
             self.sticky_header_info = *state;
-            cx.request_layout(self.data.id());
+            self.id.request_layout();
         }
     }
 
@@ -1039,9 +1012,9 @@ impl Widget for EditorView {
         &mut self,
         cx: &mut floem::context::LayoutCx,
     ) -> floem::taffy::prelude::NodeId {
-        cx.layout_node(self.data.id(), true, |cx| {
+        cx.layout_node(self.id, true, |_cx| {
             if self.inner_node.is_none() {
-                self.inner_node = Some(cx.new_node());
+                self.inner_node = Some(self.id.new_taffy_node());
             }
 
             let e_data = &self.editor;
@@ -1093,7 +1066,7 @@ impl Widget for EditorView {
                 .height(height)
                 .margin_bottom(margin_bottom)
                 .to_taffy_style();
-            cx.set_style(inner_node, style);
+            self.id.set_taffy_style(inner_node, style);
 
             vec![inner_node]
         })
@@ -1117,6 +1090,9 @@ impl Widget for EditorView {
         let config = e_data.common.config.get_untracked();
         let doc = e_data.doc();
         let is_local = doc.content.with_untracked(|content| content.is_local());
+        let find_focus = self.editor.find_focus;
+        let is_active =
+            self.is_active.get_untracked() && !find_focus.get_untracked();
 
         // We repeatedly get the screen lines because we don't currently carefully manage the
         // paint functions to avoid potentially needing to recompute them, which could *maybe*
@@ -1127,7 +1103,8 @@ impl Widget for EditorView {
         // I expect that most/all of the paint functions could restrict themselves to only what is
         // within the active screen lines without issue.
         let screen_lines = ed.screen_lines.get_untracked();
-        self.paint_cursor(cx, is_local, &screen_lines);
+        self.paint_current_line(cx, is_local, &screen_lines);
+        FloemEditorView::paint_selection(cx, ed, &screen_lines);
         let screen_lines = ed.screen_lines.get_untracked();
         self.paint_diff_sections(cx, viewport, &screen_lines, &config);
         let screen_lines = ed.screen_lines.get_untracked();
@@ -1135,7 +1112,7 @@ impl Widget for EditorView {
         let screen_lines = ed.screen_lines.get_untracked();
         self.paint_bracket_highlights_scope_lines(cx, viewport, &screen_lines);
         let screen_lines = ed.screen_lines.get_untracked();
-        FloemEditorView::paint_text(cx, ed, viewport, &screen_lines);
+        FloemEditorView::paint_text(cx, ed, viewport, is_active, &screen_lines);
         let screen_lines = ed.screen_lines.get_untracked();
         self.paint_sticky_headers(cx, viewport, &screen_lines);
         self.paint_scroll_bar(cx, viewport, is_local, config);
@@ -1283,40 +1260,36 @@ pub fn editor_container_view(
 
     stack((
         editor_breadcrumbs(workspace, editor.get_untracked(), config),
-        container(
-            stack((
-                editor_gutter(window_tab_data.clone(), editor, is_active),
-                container(editor_content(editor, debug_breakline, is_active))
-                    .style(move |s| s.size_pct(100.0, 100.0)),
-                empty().style(move |s| {
-                    let config = config.get();
-                    s.absolute()
-                        .width_pct(100.0)
-                        .height(sticky_header_height.get() as f32)
-                        // .box_shadow_blur(5.0)
-                        // .border_bottom(1.0)
-                        // .border_color(
-                        //     config.get_color(LapceColor::LAPCE_BORDER),
-                        // )
-                        .apply_if(
-                            !config.editor.sticky_header
-                                || sticky_header_height.get() == 0.0
-                                || !editor_view.get().is_normal(),
-                            |s| s.hide(),
-                        )
-                }),
-                find_view(
-                    editor,
-                    find_editor,
-                    find_focus,
-                    replace_editor,
-                    replace_active,
-                    replace_focus,
-                    is_active,
-                ),
-            ))
-            .style(|s| s.absolute().size_full()),
-        )
+        stack((
+            editor_gutter(window_tab_data.clone(), editor, is_active),
+            editor_content(editor, debug_breakline, is_active),
+            empty().style(move |s| {
+                let config = config.get();
+                s.absolute()
+                    .width_pct(100.0)
+                    .height(sticky_header_height.get() as f32)
+                    // .box_shadow_blur(5.0)
+                    // .border_bottom(1.0)
+                    // .border_color(
+                    //     config.get_color(LapceColor::LAPCE_BORDER),
+                    // )
+                    .apply_if(
+                        !config.editor.sticky_header
+                            || sticky_header_height.get() == 0.0
+                            || !editor_view.get().is_normal(),
+                        |s| s.hide(),
+                    )
+            }),
+            find_view(
+                editor,
+                find_editor,
+                find_focus,
+                replace_editor,
+                replace_active,
+                replace_focus,
+                is_active,
+            ),
+        ))
         .style(|s| s.width_full().flex_basis(0).flex_grow(1.0)),
     ))
     .on_cleanup(move || {
@@ -1345,6 +1318,7 @@ pub fn editor_container_view(
         }
     })
     .style(|s| s.flex_col().absolute().size_pct(100.0, 100.0))
+    .debug_name("Editor Container")
 }
 
 fn editor_gutter(
@@ -1501,6 +1475,7 @@ fn editor_gutter(
             }),
             empty().style(move |s| s.width(padding_right)),
         ))
+        .debug_name("Centered Last Line Count")
         .style(|s| s.height_pct(100.0)),
         clip(
             stack((
@@ -1518,7 +1493,8 @@ fn editor_gutter(
                             % config.get().editor.line_height() as f64)
                             as f32,
                     )
-                }),
+                })
+                .debug_name("Breakpoint Stack"),
                 dyn_stack(
                     move || {
                         let e_data = e_data.get();
@@ -1635,7 +1611,8 @@ fn editor_gutter(
                                 ),
                             )
                         })
-                }),
+                })
+                .debug_name("Code Action LightBulb"),
             ))
             .style(|s| s.size_pct(100.0, 100.0)),
         )
@@ -1647,6 +1624,7 @@ fn editor_gutter(
         }),
     ))
     .style(|s| s.height_pct(100.0))
+    .debug_name("Editor Gutter")
 }
 
 fn editor_breadcrumbs(
@@ -1713,7 +1691,8 @@ fn editor_breadcrumbs(
                                             ),
                                         )
                                 }),
-                                label(move || section.clone()),
+                                label(move || section.clone())
+                                    .style(move |s| s.selectable(false)),
                             ))
                             .style(|s| s.items_center())
                         },
@@ -1759,7 +1738,9 @@ fn editor_breadcrumbs(
             .width_pct(100.0)
             .height(line_height as f32)
             .apply_if(doc_path.get().is_none(), |s| s.hide())
+            .apply_if(!config.editor.show_bread_crumbs, |s| s.hide())
     })
+    .debug_name("Editor BreadCrumbs")
 }
 
 fn editor_content(
@@ -1801,7 +1782,12 @@ fn editor_content(
     scroll({
         let editor_content_view =
             editor_view(e_data.get_untracked(), debug_breakline, is_active).style(
-                move |s| s.absolute().min_size_full().cursor(CursorStyle::Text),
+                move |s| {
+                    s.absolute()
+                        .margin_left(1.0)
+                        .min_size_full()
+                        .cursor(CursorStyle::Text)
+                },
             );
 
         let id = editor_content_view.id();
@@ -1897,7 +1883,8 @@ fn editor_content(
             rect
         }
     })
-    .style(|s| s.absolute().size_pct(100.0, 100.0))
+    .style(|s| s.size_full().set(PropagatePointerWheel, false))
+    .debug_name("Editor Content")
 }
 
 fn search_editor_view(
